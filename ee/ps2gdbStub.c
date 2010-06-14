@@ -12,6 +12,8 @@
 #include <debug.h>
 #include <ps2ip.h>
 #include <tcpip.h>
+#include <loadfile.h>
+#include <string.h>
 #include "gdb-stub.h"
 #include "inst.h"
 
@@ -1434,4 +1436,6 @@ int gdb_stub_main( int argc, char *argv[] )
 		ExitDeleteThread();
 		return -1;
 	}
+
+	return 0;
 }
