@@ -12,8 +12,9 @@
 #include <debug.h>
 #include <ps2ip.h>
 #include <tcpip.h>
-#include <loadfile.h>
 #include <string.h>
+#include <loadfile.h>
+
 #include "gdb-stub.h"
 #include "inst.h"
 
@@ -82,6 +83,7 @@ static int hex(unsigned char ch);
 static int hexToInt(char **ptr, int *intValue);
 static unsigned char *mem2hex(char *mem, char *buf, int count, int may_fault);
 void handle_exception( gdb_regs_ps2 *regs );
+static int gdbstub_net_accept();
 
 // These are the gdb buffers. For the tcpip comms, there are seperate buffers, which fill input_buffer and output_buffer when
 // needed.
@@ -167,7 +169,7 @@ struct sockaddr_in gdb_local_addr_g;
 struct sockaddr_in gdb_remote_addr_g;
 fd_set comms_fd_g;
 int sh_g;
-int cs_g;
+int cs_g = -1;
 int alarmid_g;
 
 // Don't want to wait around too much.
@@ -322,7 +324,12 @@ char getDebugChar()
 		return( gdbstub_recv_buffer_g[recvd_chars_processed++] );
 	}
 
-	gdbstub_error( "Couldn't get a char\n" );
+
+	printf("Waiting for remote GDB to connect\n");
+	while (gdbstub_net_accept() == -1)
+	{
+		printf("GDB reconnect failed.\n");
+	}
 
 	return 0xff;
 }
@@ -446,6 +453,9 @@ static void putpacket(char *buffer)
 	unsigned char checksum;
 	unsigned char ch;
 	int count, sent_size;
+	int n;
+	int len;
+
 	gdbstub_send_buffer_g[0] = '$';
 	checksum = 0;
 	count = 0;
@@ -462,13 +472,43 @@ static void putpacket(char *buffer)
 	while( !gdbstub_ready_to_send() ) {
 		;
 	}
-	sent_size = send( cs_g, gdbstub_send_buffer_g, count+4, 0 );
+	len = count+4;
+	sent_size = n = send(cs_g, gdbstub_send_buffer_g, len, 0);
+	// Send buffer of ps2ips (1024 Bytes) could be to small when sending all registers:
+	while (sent_size < len)
+	{
+		n = send(cs_g, &gdbstub_send_buffer_g[sent_size], len - sent_size, 0);
+		if (n <= 0)
+			break;
+		sent_size += n;
+	}
 	while ((getDebugChar() & 0x7f) != '+');		// Wait for ack.
 }
 
 // Indicate to caller of mem2hex or hex2mem that there
 // has been an error. WHAT'S THIS ABOUT THEN???
 static volatile int mem_err = 0;
+
+// Convert register to hex (Print 64 bit register).
+static unsigned char *reg2hex(char *mem, char *buf, int count, int may_fault)
+{
+	unsigned char *ptr;
+	unsigned int i;
+	unsigned int j;
+
+	ptr = buf;
+
+	for (i = 0; i < count; i += 4)
+	{
+		ptr = mem2hex(&mem[i], ptr, 4, may_fault);
+		for (j = 0; j < 8; j++)
+		{
+			*ptr++ = hexchars[0];
+		}
+	}
+
+	return ptr;
+}
 
 
 // Convert the memory pointed to by mem into hex, placing result in buf.
@@ -512,6 +552,21 @@ static unsigned char *mem2hex(char *mem, char *buf, int count, int may_fault)
 	return buf;
 }
 
+// Copy hex to register
+static char *hex2reg(char *buf, char *mem, int count, int may_fault)
+{
+	char *ptr;
+	int i;
+
+	ptr = mem;
+
+	for (i = 0; i < count; i += 4)
+	{
+		// Only use lower 32 bit.
+		ptr = hex2mem(&buf[4*i], ptr, 4, may_fault);
+	}
+	return ptr;
+}
 
 // Writes the binary of the hex array pointed to by into mem.
 // Returns a pointer to the byte AFTER the last written.
@@ -1029,7 +1084,7 @@ void handle_exception( gdb_regs_ps2 *ps2_regs )
 	*ptr++ = hexchars[REG_EPC >> 4];
 	*ptr++ = hexchars[REG_EPC & 0xf];
 	*ptr++ = ':';
-	ptr = mem2hex((char *)&regs->cp0_epc, ptr, 4, 0);
+	ptr = reg2hex((char *)&regs->cp0_epc, ptr, 4, 0);
 	*ptr++ = ';';
 
 #ifdef COMPILER_USES_30_AS_FP
@@ -1037,14 +1092,14 @@ void handle_exception( gdb_regs_ps2 *ps2_regs )
 	*ptr++ = hexchars[REG_FP >> 4];
 	*ptr++ = hexchars[REG_FP & 0xf];
 	*ptr++ = ':';
-	ptr = mem2hex((char *)&regs->reg30, ptr, 4, 0);
+	ptr = reg2hex((char *)&regs->reg30, ptr, 4, 0);
 	*ptr++ = ';';
 #else
 	// Send stack pointer as frame pointer instead, it's the best we can do?
 	*ptr++ = hexchars[REG_FP >> 4];
 	*ptr++ = hexchars[REG_FP & 0xf];
 	*ptr++ = ':';
-	ptr = mem2hex((char *)&regs->reg29, ptr, 4, 0);
+	ptr = reg2hex((char *)&regs->reg29, ptr, 4, 0);
 	*ptr++ = ';';
 #endif
 
@@ -1052,7 +1107,7 @@ void handle_exception( gdb_regs_ps2 *ps2_regs )
 	*ptr++ = hexchars[REG_SP >> 4];
 	*ptr++ = hexchars[REG_SP & 0xf];
 	*ptr++ = ':';
-	ptr = mem2hex((char *)&regs->reg29, ptr, 4, 0);
+	ptr = reg2hex((char *)&regs->reg29, ptr, 4, 0);
 	*ptr++ = ';';
 
 	// put the packet.
@@ -1090,12 +1145,13 @@ void handle_exception( gdb_regs_ps2 *ps2_regs )
 
 		// Return the value of the CPU registers.
 		case 'g':
-			ptr = mem2hex((char *)&regs->reg0, ptr, 32*4, 0);		// r0...r31
-			ptr = mem2hex((char *)&regs->cp0_status, ptr, 6*4, 0);	// status, lo, hi, bad, cause, pc (epc!).
-			ptr = mem2hex((char *)&regs->fpr0, ptr, 32*4, 0);		// f0...31
-			ptr = mem2hex((char *)&regs->cp1_fsr, ptr, 2*4, 0);		// cp1
-			ptr = mem2hex((char *)&regs->frame_ptr, ptr, 2*4, 0);	// fp, dummy. What's dummy for?
-			ptr = mem2hex((char *)&regs->cp0_index, ptr, 16*4, 0);	// index, random, entrylo0, entrylo0 ... prid
+			ptr = reg2hex((char *)&regs->reg0, ptr, 32*4, 0);		// r0...r31
+			ptr = reg2hex((char *)&regs->cp0_status, ptr, 6*4, 0);	// status, lo, hi, bad, cause, pc (epc!).
+			ptr = reg2hex((char *)&regs->fpr0, ptr, 32*4, 0);		// f0...31
+			ptr = mem2hex((char *)&regs->cp1_fsr, ptr, 4, 0);		// cp1
+			ptr = mem2hex((char *)&regs->cp1_fir, ptr, 4, 0);		// cp1
+			/*ptr = reg2hex((char *)&regs->frame_ptr, ptr, 4, 0);	// fp, dummy. What's dummy for?
+			ptr = reg2hex((char *)&regs->cp0_index, ptr, 16*4, 0);	// index, random, entrylo0, entrylo0 ... prid*/
 			break;
 
 		// Set the value of the CPU registers - return OK.
@@ -1104,7 +1160,17 @@ void handle_exception( gdb_regs_ps2 *ps2_regs )
 			// TODO :: Test this, what about the SP stuff?
 			ptr2 = &input_buffer[1];
 			printf("DODGY G COMMAND RECIEVED\n");
-			hex2mem(ptr2, (char *)regs, 90*4, 0);					// All regs.
+			//hex2reg(ptr2, (char *)regs, 90*4, 0);					// All regs.
+			hex2reg(ptr2, (char *)&regs->reg0, 32*4, 0);
+			ptr2 = &ptr2[32*16];
+			hex2reg(ptr2, (char *)&regs->cp0_status, 6*4, 0);
+			ptr2 = &ptr2[6*16];
+			hex2reg(ptr2, (char *)&regs->fpr0, 32*4, 0);
+			ptr2 = &ptr2[32*16];
+			hex2mem(ptr2, (char *)&regs->cp1_fsr, 4, 0);
+			ptr2 = &ptr2[1*8];
+			hex2mem(ptr2, (char *)&regs->cp1_fir, 4, 0);
+			ptr2 = &ptr2[1*8];
 			// Not sure about this part, so I'm not doing it.
 			// See if the stack pointer has moved. If so, then copy the saved locals and ins to the new location.
 			// newsp = (unsigned long *)registers[SP];
@@ -1278,7 +1344,7 @@ void breakpoint(void)
 // -1 == failure
 int gdbstub_net_open()
 {
-	int remote_len, tmp;
+	int tmp;
 	int rc_bind, rc_listen;
 
 	if( SifLoadModule(HOSTPATHIRX "ps2ips.irx", 0, NULL) < 0 ) {
@@ -1323,8 +1389,18 @@ int gdbstub_net_open()
 		return -1;
 	}
 	gdbstub_printf( DEBUG_COMMSINIT, "Listen returned %i.\n", rc_listen );
+	return 0;
+}
+
+static int gdbstub_net_accept()
+{
+	int remote_len;
+	int tmp;
 
 	remote_len = sizeof( gdb_remote_addr_g );
+	// Disconnect last connection if there was any.
+	if (cs_g >= 0)
+		disconnect(cs_g);
 	cs_g = accept( sh_g, (struct sockaddr *)&gdb_remote_addr_g, &remote_len );
 
 	if ( cs_g < 0 ) {
@@ -1347,7 +1423,6 @@ int gdbstub_net_open()
 	return 0;
 }
 
-
 void gdbstub_net_close()
 {
 	disconnect( cs_g );
@@ -1367,7 +1442,8 @@ int gdbstub_init( int argc, char *argv[] )
 	gdbstub_num_exceptions_g = 0;
 	thread_id_g = GetThreadId();
 
-	if( gdbstub_net_open() == -1 ) {
+	if( gdbstub_net_open() == -1 
+		|| gdbstub_net_accept() == -1) {
 		gdbstub_error("failed to open net connection.\n");
 		return -1;
 	}
@@ -1436,6 +1512,5 @@ int gdb_stub_main( int argc, char *argv[] )
 		ExitDeleteThread();
 		return -1;
 	}
-
 	return 0;
 }
